@@ -61,18 +61,15 @@
     // Next lints produce too much noise/false positives.
     clippy::module_name_repetitions, clippy::similar_names, clippy::must_use_candidate,
     // '... may panic' lints.
-    clippy::indexing_slicing,
     // Too much work to fix.
     clippy::missing_errors_doc,
     // False positive: WebSocket
     clippy::doc_markdown,
     clippy::missing_safety_doc,
     clippy::needless_pass_by_value,
-    clippy::option_if_let_else,
     clippy::ptr_as_ptr,
     clippy::missing_panics_doc,
     clippy::from_over_into,
-    clippy::upper_case_acronyms,
 )]
 
 #[macro_use]
@@ -90,6 +87,7 @@ mod db_options;
 mod db_pinnable_slice;
 pub mod merge_operator;
 pub mod perf;
+pub mod properties;
 mod slice_transform;
 mod snapshot;
 mod sst_file_writer;
@@ -101,7 +99,7 @@ pub use crate::{
         ColumnFamilyRef, DEFAULT_COLUMN_FAMILY_NAME,
     },
     compaction_filter::Decision as CompactionDecision,
-    db::{DBWithThreadMode, LiveFile, MultiThreaded, SingleThreaded, ThreadMode, DB},
+    db::{DBAccess, DBWithThreadMode, LiveFile, MultiThreaded, SingleThreaded, ThreadMode, DB},
     db_iterator::{
         DBIterator, DBIteratorWithThreadMode, DBRawIterator, DBRawIteratorWithThreadMode,
         DBWALIterator, Direction, IteratorMode,
@@ -171,6 +169,8 @@ impl fmt::Display for Error {
 #[cfg(test)]
 mod test {
     use super::{
+        column_family::UnboundColumnFamily,
+        db_options::{CacheWrapper, EnvWrapper},
         BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamily, ColumnFamilyDescriptor,
         DBIterator, DBRawIterator, Env, IngestExternalFileOptions, Options,
         PlainTableFactoryOptions, ReadOptions, Snapshot, SstFileWriter, WriteBatch, WriteOptions,
@@ -199,10 +199,13 @@ mod test {
         is_send::<ColumnFamilyDescriptor>();
         is_send::<ColumnFamily>();
         is_send::<BoundColumnFamily<'_>>();
+        is_send::<UnboundColumnFamily>();
         is_send::<SstFileWriter>();
         is_send::<WriteBatch>();
         is_send::<Cache>();
+        is_send::<CacheWrapper>();
         is_send::<Env>();
+        is_send::<EnvWrapper>();
     }
 
     #[test]
@@ -221,9 +224,12 @@ mod test {
         is_sync::<IngestExternalFileOptions>();
         is_sync::<BlockBasedOptions>();
         is_sync::<PlainTableFactoryOptions>();
+        is_sync::<UnboundColumnFamily>();
         is_sync::<ColumnFamilyDescriptor>();
         is_sync::<SstFileWriter>();
         is_sync::<Cache>();
+        is_sync::<CacheWrapper>();
         is_sync::<Env>();
+        is_sync::<EnvWrapper>();
     }
 }

@@ -145,6 +145,25 @@ pub trait DBAccess {
         key: K,
         readopts: &ReadOptions,
     ) -> Result<Option<Vec<u8>>, Error>;
+
+    fn multi_get_opt<K, I>(
+        &self,
+        keys: I,
+        readopts: &ReadOptions,
+    ) -> Vec<Result<Option<Vec<u8>>, Error>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = K>;
+
+    fn multi_get_cf_opt<'b, K, I, W>(
+        &self,
+        keys_cf: I,
+        readopts: &ReadOptions,
+    ) -> Vec<Result<Option<Vec<u8>>, Error>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = (&'b W, K)>,
+        W: AsColumnFamilyRef + 'b;
 }
 
 impl<T: ThreadMode> DBAccess for DBWithThreadMode<T> {
@@ -167,6 +186,31 @@ impl<T: ThreadMode> DBAccess for DBWithThreadMode<T> {
         readopts: &ReadOptions,
     ) -> Result<Option<Vec<u8>>, Error> {
         self.get_cf_opt(cf, key, readopts)
+    }
+
+    fn multi_get_opt<K, I>(
+        &self,
+        keys: I,
+        readopts: &ReadOptions,
+    ) -> Vec<Result<Option<Vec<u8>>, Error>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = K>,
+    {
+        self.multi_get_opt(keys, readopts)
+    }
+
+    fn multi_get_cf_opt<'b, K, I, W>(
+        &self,
+        keys_cf: I,
+        readopts: &ReadOptions,
+    ) -> Vec<Result<Option<Vec<u8>>, Error>>
+    where
+        K: AsRef<[u8]>,
+        I: IntoIterator<Item = (&'b W, K)>,
+        W: AsColumnFamilyRef + 'b,
+    {
+        self.multi_get_cf_opt(keys_cf, readopts)
     }
 }
 
@@ -201,7 +245,7 @@ pub type DB = DBWithThreadMode<MultiThreaded>;
 // Safety note: auto-implementing Send on most db-related types is prevented by the inner FFI
 // pointer. In most cases, however, this pointer is Send-safe because it is never aliased and
 // rocksdb internally does not rely on thread-local information for its user-exposed types.
-unsafe impl<T: ThreadMode> Send for DBWithThreadMode<T> {}
+unsafe impl<T: ThreadMode + Send> Send for DBWithThreadMode<T> {}
 
 // Sync is similarly safe for many types because they do not expose interior mutability, and their
 // use within the rocksdb library is generally behind a const reference
@@ -333,6 +377,54 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         )
     }
 
+    /// Opens a database for read only with the given database options and column family names.
+    pub fn open_cf_with_opts_for_read_only<P, I, N>(
+        db_opts: &Options,
+        path: P,
+        cfs: I,
+        error_if_log_file_exist: bool,
+    ) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = (N, Options)>,
+        N: AsRef<str>,
+    {
+        let cfs = cfs
+            .into_iter()
+            .map(|(name, cf_opts)| ColumnFamilyDescriptor::new(name.as_ref(), cf_opts));
+
+        Self::open_cf_descriptors_internal(
+            db_opts,
+            path,
+            cfs,
+            &AccessType::ReadOnly {
+                error_if_log_file_exist,
+            },
+        )
+    }
+
+    /// Opens a database for ready only with the given database options and
+    /// column family descriptors.
+    pub fn open_cf_descriptors_read_only<P, I>(
+        opts: &Options,
+        path: P,
+        cfs: I,
+        error_if_log_file_exist: bool,
+    ) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = ColumnFamilyDescriptor>,
+    {
+        Self::open_cf_descriptors_internal(
+            opts,
+            path,
+            cfs,
+            &AccessType::ReadOnly {
+                error_if_log_file_exist,
+            },
+        )
+    }
+
     /// Opens the database as a secondary with the given database options and column family names.
     pub fn open_cf_as_secondary<P, I, N>(
         opts: &Options,
@@ -352,6 +444,28 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         Self::open_cf_descriptors_internal(
             opts,
             primary_path,
+            cfs,
+            &AccessType::Secondary {
+                secondary_path: secondary_path.as_ref(),
+            },
+        )
+    }
+
+    /// Opens the database as a secondary with the given database options and
+    /// column family descriptors.
+    pub fn open_cf_descriptors_as_secondary<P, I>(
+        opts: &Options,
+        path: P,
+        secondary_path: P,
+        cfs: I,
+    ) -> Result<Self, Error>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = ColumnFamilyDescriptor>,
+    {
+        Self::open_cf_descriptors_internal(
+            opts,
+            path,
             cfs,
             &AccessType::Secondary {
                 secondary_path: secondary_path.as_ref(),
@@ -844,26 +958,22 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
         I: IntoIterator<Item = (&'b W, K)>,
         W: AsColumnFamilyRef,
     {
-        let mut boxed_keys: Vec<Box<[u8]>> = Vec::new();
-        let mut keys_sizes = Vec::new();
-        let mut column_families = Vec::new();
-        for (cf, key) in keys {
-            boxed_keys.push(Box::from(key.as_ref()));
-            keys_sizes.push(key.as_ref().len());
-            column_families.push(cf);
-        }
-        let ptr_keys: Vec<_> = boxed_keys
+        let (cfs_and_keys, keys_sizes): (Vec<(_, Box<[u8]>)>, Vec<_>) = keys
+            .into_iter()
+            .map(|(cf, key)| ((cf, Box::from(key.as_ref())), key.as_ref().len()))
+            .unzip();
+        let ptr_keys: Vec<_> = cfs_and_keys
             .iter()
-            .map(|k| k.as_ptr() as *const c_char)
+            .map(|(_, k)| k.as_ptr() as *const c_char)
             .collect();
-        let ptr_cfs: Vec<_> = column_families
+        let ptr_cfs: Vec<_> = cfs_and_keys
             .iter()
-            .map(|c| c.inner() as *const _)
+            .map(|(c, _)| c.inner() as *const _)
             .collect();
 
-        let mut values = vec![ptr::null_mut(); boxed_keys.len()];
-        let mut values_sizes = vec![0_usize; boxed_keys.len()];
-        let mut errors = vec![ptr::null_mut(); boxed_keys.len()];
+        let mut values = vec![ptr::null_mut(); ptr_keys.len()];
+        let mut values_sizes = vec![0_usize; ptr_keys.len()];
+        let mut errors = vec![ptr::null_mut(); ptr_keys.len()];
         unsafe {
             ffi::rocksdb_multi_get_cf(
                 self.inner,
@@ -1304,9 +1414,9 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
             ffi::rocksdb_compact_range(
                 self.inner,
                 opt_bytes_to_ptr(start),
-                start.map_or(0, |s| s.len()) as size_t,
+                start.map_or(0, <[u8]>::len) as size_t,
                 opt_bytes_to_ptr(end),
-                end.map_or(0, |e| e.len()) as size_t,
+                end.map_or(0, <[u8]>::len) as size_t,
             );
         }
     }
@@ -1326,9 +1436,9 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
                 self.inner,
                 opts.inner,
                 opt_bytes_to_ptr(start),
-                start.map_or(0, |s| s.len()) as size_t,
+                start.map_or(0, <[u8]>::len) as size_t,
                 opt_bytes_to_ptr(end),
-                end.map_or(0, |e| e.len()) as size_t,
+                end.map_or(0, <[u8]>::len) as size_t,
             );
         }
     }
@@ -1349,9 +1459,9 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
                 self.inner,
                 cf.inner(),
                 opt_bytes_to_ptr(start),
-                start.map_or(0, |s| s.len()) as size_t,
+                start.map_or(0, <[u8]>::len) as size_t,
                 opt_bytes_to_ptr(end),
-                end.map_or(0, |e| e.len()) as size_t,
+                end.map_or(0, <[u8]>::len) as size_t,
             );
         }
     }
@@ -1373,9 +1483,9 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
                 cf.inner(),
                 opts.inner,
                 opt_bytes_to_ptr(start),
-                start.map_or(0, |s| s.len()) as size_t,
+                start.map_or(0, <[u8]>::len) as size_t,
                 opt_bytes_to_ptr(end),
-                end.map_or(0, |e| e.len()) as size_t,
+                end.map_or(0, <[u8]>::len) as size_t,
             );
         }
     }
@@ -1668,6 +1778,8 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
                 let mut key_size: usize = 0;
 
                 for i in 0..n {
+                    let column_family_name =
+                        from_cstr(ffi::rocksdb_livefiles_column_family_name(files, i));
                     let name = from_cstr(ffi::rocksdb_livefiles_name(files, i));
                     let size = ffi::rocksdb_livefiles_size(files, i);
                     let level = ffi::rocksdb_livefiles_level(files, i) as i32;
@@ -1681,6 +1793,7 @@ impl<T: ThreadMode> DBWithThreadMode<T> {
                     let largest_key = raw_data(largest_key, key_size);
 
                     livefiles.push(LiveFile {
+                        column_family_name,
                         name,
                         size,
                         level,
@@ -1844,6 +1957,8 @@ impl<T: ThreadMode> fmt::Debug for DBWithThreadMode<T> {
 /// The metadata that describes a SST file
 #[derive(Debug, Clone)]
 pub struct LiveFile {
+    /// Name of the column family the file belongs to
+    pub column_family_name: String,
     /// Name of the file
     pub name: String,
     /// Size of the file

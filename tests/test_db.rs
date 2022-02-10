@@ -20,10 +20,10 @@ use pretty_assertions::assert_eq;
 
 use rocksdb::{
     perf::get_memory_usage_stats, BlockBasedOptions, BottommostLevelCompaction, Cache,
-    CompactOptions, CuckooTableOptions, DBCompactionStyle, DBWithThreadMode, Env, Error,
-    FifoCompactOptions, IteratorMode, MultiThreaded, Options, PerfContext, PerfMetric, ReadOptions,
-    SingleThreaded, SliceTransform, Snapshot, UniversalCompactOptions,
-    UniversalCompactionStopStyle, WriteBatch, DB,
+    ColumnFamilyDescriptor, CompactOptions, CuckooTableOptions, DBAccess, DBCompactionStyle,
+    DBWithThreadMode, Env, Error, FifoCompactOptions, IteratorMode, MultiThreaded, Options,
+    PerfContext, PerfMetric, ReadOptions, SingleThreaded, SliceTransform, Snapshot,
+    UniversalCompactOptions, UniversalCompactionStopStyle, WriteBatch, DB,
 };
 use util::DBPath;
 
@@ -514,6 +514,46 @@ fn test_open_as_secondary() {
 }
 
 #[test]
+fn test_open_cf_descriptors_as_secondary() {
+    let primary_path = DBPath::new("_rust_rocksdb_test_open_cf_descriptors_as_secondary_primary");
+    let mut primary_opts = Options::default();
+    primary_opts.create_if_missing(true);
+    primary_opts.create_missing_column_families(true);
+    let cfs = vec!["cf1"];
+    let primary_db = DB::open_cf(&primary_opts, &primary_path, &cfs).unwrap();
+    let primary_cf1 = primary_db.cf_handle("cf1").unwrap();
+    primary_db.put_cf(&primary_cf1, b"k1", b"v1").unwrap();
+
+    let secondary_path =
+        DBPath::new("_rust_rocksdb_test_open_cf_descriptors_as_secondary_secondary");
+    let mut secondary_opts = Options::default();
+    secondary_opts.set_max_open_files(-1);
+    let cfs = cfs
+        .into_iter()
+        .map(|name| ColumnFamilyDescriptor::new(name, Options::default()));
+    let secondary_db =
+        DB::open_cf_descriptors_as_secondary(&secondary_opts, &primary_path, &secondary_path, cfs)
+            .unwrap();
+    let secondary_cf1 = secondary_db.cf_handle("cf1").unwrap();
+    assert_eq!(
+        secondary_db.get_cf(&secondary_cf1, b"k1").unwrap().unwrap(),
+        b"v1"
+    );
+    assert!(secondary_db.put_cf(&secondary_cf1, b"k2", b"v2").is_err());
+
+    primary_db.put_cf(&primary_cf1, b"k1", b"v2").unwrap();
+    assert_eq!(
+        secondary_db.get_cf(&secondary_cf1, b"k1").unwrap().unwrap(),
+        b"v1"
+    );
+    assert!(secondary_db.try_catch_up_with_primary().is_ok());
+    assert_eq!(
+        secondary_db.get_cf(&secondary_cf1, b"k1").unwrap().unwrap(),
+        b"v2"
+    );
+}
+
+#[test]
 fn test_open_with_ttl() {
     let path = DBPath::new("_rust_rocksdb_test_open_with_ttl");
 
@@ -660,6 +700,19 @@ fn fifo_compaction_test() {
             let expect = format!("block_cache_hit_count = {}", block_cache_hit_count);
             assert!(ctx.report(true).contains(&expect));
         }
+
+        // check live files (sst files meta)
+        let livefiles = db.live_files().unwrap();
+        assert_eq!(livefiles.len(), 1);
+        livefiles.iter().for_each(|f| {
+            assert_eq!(f.level, 1);
+            assert_eq!(f.column_family_name, "cf1");
+            assert!(!f.name.is_empty());
+            assert_eq!(f.start_key.as_ref().unwrap().as_slice(), "k1".as_bytes());
+            assert_eq!(f.end_key.as_ref().unwrap().as_slice(), "k5".as_bytes());
+            assert_eq!(f.num_entries, 5);
+            assert_eq!(f.num_deletions, 0);
+        });
     }
 }
 
@@ -798,6 +851,7 @@ fn get_with_cache_and_bulkload_test() {
         assert_eq!(livefiles.len(), 1);
         livefiles.iter().for_each(|f| {
             assert_eq!(f.level, 2);
+            assert_eq!(f.column_family_name, "default");
             assert!(!f.name.is_empty());
             assert_eq!(
                 f.start_key.as_ref().unwrap().as_slice(),
@@ -894,6 +948,32 @@ fn test_open_cf_for_read_only() {
 }
 
 #[test]
+fn test_open_cf_descriptors_for_read_only() {
+    let path = DBPath::new("_rust_rocksdb_test_open_cf_descriptors_for_read_only");
+    let cfs = vec!["cf1"];
+    {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let db = DB::open_cf(&opts, &path, &cfs).unwrap();
+        let cf1 = db.cf_handle("cf1").unwrap();
+        db.put_cf(&cf1, b"k1", b"v1").unwrap();
+    }
+    {
+        let opts = Options::default();
+        let error_if_log_file_exist = false;
+        let cfs = cfs
+            .into_iter()
+            .map(|name| ColumnFamilyDescriptor::new(name, Options::default()));
+        let db =
+            DB::open_cf_descriptors_read_only(&opts, &path, cfs, error_if_log_file_exist).unwrap();
+        let cf1 = db.cf_handle("cf1").unwrap();
+        assert_eq!(db.get_cf(&cf1, b"k1").unwrap().unwrap(), b"v1");
+        assert!(db.put_cf(&cf1, b"k2", b"v2").is_err());
+    }
+}
+
+#[test]
 fn delete_range_test() {
     let path = DBPath::new("_rust_rocksdb_delete_range_test");
     {
@@ -926,20 +1006,59 @@ fn multi_get() {
 
     {
         let db = DB::open_default(&path).unwrap();
+        let initial_snap = db.snapshot();
         db.put(b"k1", b"v1").unwrap();
+        let k1_snap = db.snapshot();
         db.put(b"k2", b"v2").unwrap();
 
         let _ = db.multi_get(&[b"k0"; 40]);
+
+        let assert_values = |values: Vec<_>| {
+            assert_eq!(3, values.len());
+            assert_eq!(values[0], None);
+            assert_eq!(values[1], Some(b"v1".to_vec()));
+            assert_eq!(values[2], Some(b"v2".to_vec()));
+        };
 
         let values = db
             .multi_get(&[b"k0", b"k1", b"k2"])
             .into_iter()
             .map(Result::unwrap)
             .collect::<Vec<_>>();
-        assert_eq!(3, values.len());
-        assert_eq!(values[0], None);
-        assert_eq!(values[1], Some(b"v1".to_vec()));
-        assert_eq!(values[2], Some(b"v2".to_vec()));
+
+        assert_values(values);
+
+        let values = DBAccess::multi_get_opt(&db, &[b"k0", b"k1", b"k2"], &Default::default())
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        assert_values(values);
+
+        let values = db
+            .snapshot()
+            .multi_get(&[b"k0", b"k1", b"k2"])
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        assert_values(values);
+
+        let none_values = initial_snap
+            .multi_get(&[b"k0", b"k1", b"k2"])
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        assert_eq!(none_values, vec![None; 3]);
+
+        let k1_only = k1_snap
+            .multi_get(&[b"k0", b"k1", b"k2"])
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        assert_eq!(k1_only, vec![None, Some(b"v1".to_vec()), None]);
     }
 }
 
@@ -979,11 +1098,8 @@ fn key_may_exist() {
 
     {
         let db = DB::open_default(&path).unwrap();
-        assert_eq!(false, db.key_may_exist("nonexistent"));
-        assert_eq!(
-            false,
-            db.key_may_exist_opt("nonexistent", &ReadOptions::default())
-        );
+        assert!(!db.key_may_exist("nonexistent"));
+        assert!(!db.key_may_exist_opt("nonexistent", &ReadOptions::default()));
     }
 }
 
@@ -998,11 +1114,8 @@ fn key_may_exist_cf() {
         let db = DB::open_cf(&opts, &path, &["cf"]).unwrap();
         let cf = db.cf_handle("cf").unwrap();
 
-        assert_eq!(false, db.key_may_exist_cf(&cf, "nonexistent"));
-        assert_eq!(
-            false,
-            db.key_may_exist_cf_opt(&cf, "nonexistent", &ReadOptions::default())
-        );
+        assert!(!db.key_may_exist_cf(&cf, "nonexistent"));
+        assert!(!db.key_may_exist_cf_opt(&cf, "nonexistent", &ReadOptions::default()));
     }
 }
 
